@@ -1,0 +1,357 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken,
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  updateDoc,
+  collection
+} from 'firebase/firestore';
+import { 
+  Zap, 
+  Plus, 
+  Loader2, 
+  Activity, 
+  Flame, 
+  Crown, 
+  Trophy, 
+  Target
+} from 'lucide-react';
+
+// --- 1. FIREBASE CONFIGURATION ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'pulse-chess-v1';
+
+// --- 2. GAME CONSTANTS ---
+const INITIAL_BOARD = [
+  ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'],
+  ['p', 'p', 'p', 'p', 'p', 'p', 'p', 'p'],
+  [null, null, null, null, null, null, null, null],
+  [null, null, null, null, null, null, null, null],
+  [null, null, null, null, null, null, null, null],
+  [null, null, null, null, null, null, null, null],
+  ['P', 'P', 'P', 'P', 'P', 'P', 'P', 'P'],
+  ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R']
+];
+
+const PIECE_ICONS = {
+  'r': '♜', 'n': '♞', 'b': '♝', 'q': '♛', 'k': '♚', 'p': '♟',
+  'R': '♖', 'N': '♘', 'B': '♗', 'Q': '♕', 'K': '♔', 'P': '♙'
+};
+
+const CORE_SQUARES = [[3,3], [3,4], [4,3], [4,4]]; 
+
+const PULSE_REWARDS = {
+  p: 1, n: 2, b: 2, r: 3, q: 4,
+  P: 1, N: 2, B: 2, R: 3, Q: 4
+};
+
+// --- 3. MAIN COMPONENT ---
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('lobby'); 
+  const [currentGameId, setCurrentGameId] = useState(null);
+  const [gameData, setGameData] = useState(null);
+  const [selectedSquare, setSelectedSquare] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [surgeActive, setSurgeActive] = useState(false);
+  const [surgePiecePos, setSurgePiecePos] = useState(null);
+
+  // Auth initialization
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth failed:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    return () => unsubscribe();
+  }, []);
+
+  // Firestore Data Sync
+  useEffect(() => {
+    if (!user || !currentGameId) return;
+    
+    // RULE 1 FIX: Path segment count must be even. 
+    // /artifacts/{appId}/public/data/{collectionName}/{docId}
+    // Segments: 1:artifacts, 2:appId, 3:public, 4:data, 5:games, 6:currentGameId
+    const gameDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', currentGameId);
+    
+    const unsubscribe = onSnapshot(gameDocRef, 
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setGameData(data);
+          const myColor = user.uid === data.players.white ? 'white' : 'black';
+          if (data.turn !== myColor) {
+            setSurgeActive(false);
+            setSurgePiecePos(null);
+          }
+        } else {
+          setView('lobby');
+          setCurrentGameId(null);
+        }
+      }, 
+      (error) => console.error("Firestore error:", error)
+    );
+    return () => unsubscribe();
+  }, [user, currentGameId]);
+
+  const createGame = async () => {
+    if (!user) return;
+    const newGameId = Math.random().toString(36).substring(2, 9).toUpperCase();
+    const newGame = {
+      id: newGameId,
+      board: JSON.stringify(INITIAL_BOARD),
+      turn: 'white',
+      players: { white: user.uid, black: null },
+      pulsePoints: { white: 0, black: 0 },
+      crownStepUsed: { white: false, black: false },
+      status: 'waiting',
+      winner: null,
+      lastMove: null,
+      createdAt: Date.now()
+    };
+    try {
+      // RULE 1 FIX: Use even number of path segments
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', newGameId);
+      await setDoc(docRef, newGame);
+      setCurrentGameId(newGameId);
+      setView('game');
+    } catch (err) { console.error(err); }
+  };
+
+  const joinGame = async (gameId) => {
+    if (!user) return;
+    const gId = gameId.toUpperCase();
+    try {
+      const gameDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', gId);
+      await updateDoc(gameDocRef, { 'players.black': user.uid, 'status': 'active' });
+      setCurrentGameId(gId);
+      setView('game');
+    } catch (err) { console.error(err); }
+  };
+
+  const movePiece = async (fromRow, fromCol, toRow, toCol, isCrownStep = false) => {
+    if (!gameData || !user || gameData.winner) return;
+    const playerColor = user.uid === gameData.players.white ? 'white' : 'black';
+    if (gameData.turn !== playerColor) return;
+
+    const board = JSON.parse(gameData.board);
+    const piece = board[fromRow][fromCol];
+    const target = board[toRow][toCol];
+
+    if (surgeActive && target) return; 
+
+    let pulseGained = 0;
+    if (target && !surgeActive) { pulseGained += (PULSE_REWARDS[target] || 0); }
+
+    const isCore = CORE_SQUARES.some(([r, c]) => r === toRow && c === toCol);
+    if (isCore) { pulseGained += 1; }
+
+    const currentPoints = gameData.pulsePoints[playerColor];
+    let newPointsCount = currentPoints + pulseGained;
+    
+    let winner = null;
+    if (newPointsCount >= 10) { winner = playerColor; }
+
+    const cappedPoints = Math.min(newPointsCount, 5);
+    board[toRow][toCol] = piece;
+    board[fromRow][fromCol] = null;
+
+    const nextTurn = playerColor === 'white' ? 'black' : 'white';
+    
+    const update = {
+      board: JSON.stringify(board),
+      pulsePoints: { ...gameData.pulsePoints, [playerColor]: winner ? newPointsCount : cappedPoints },
+      lastMove: { from: [fromRow, fromCol], to: [toRow, toCol] },
+      winner: winner,
+      turn: nextTurn
+    };
+
+    if (isCrownStep) { update.crownStepUsed = { ...gameData.crownStepUsed, [playerColor]: true }; }
+
+    try {
+      const gameDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', currentGameId);
+      await updateDoc(gameDocRef, update);
+      setSelectedSquare(null);
+      setSurgeActive(false);
+      setSurgePiecePos(null);
+    } catch (err) { console.error(err); }
+  };
+
+  const handleSquareClick = (row, col) => {
+    if (!gameData || gameData.winner) return;
+    const board = JSON.parse(gameData.board);
+    const piece = board[row][col];
+    const myColor = user.uid === gameData.players.white ? 'white' : 'black';
+
+    if (selectedSquare) {
+      const [sRow, sCol] = selectedSquare;
+      if (sRow === row && sCol === col) { setSelectedSquare(null); } 
+      else {
+        const movingPiece = board[sRow][sCol];
+        const isKing = movingPiece?.toLowerCase() === 'k';
+        const rowDiff = Math.abs(row - sRow);
+        const colDiff = Math.abs(col - sCol);
+        const isKnightMove = (rowDiff === 2 && colDiff === 1) || (rowDiff === 1 && colDiff === 2);
+        
+        if (isKing && isKnightMove && !gameData.crownStepUsed[myColor] && !surgeActive) {
+          movePiece(sRow, sCol, row, col, true);
+        } else {
+          movePiece(sRow, sCol, row, col);
+        }
+      }
+    } else if (piece) {
+      if (surgeActive && (row !== surgePiecePos[0] || col !== surgePiecePos[1])) return;
+      const isWhitePiece = piece === piece.toUpperCase();
+      const isMyTurn = gameData.turn === myColor;
+      if (isMyTurn && ((isWhitePiece && myColor === 'white') || (!isWhitePiece && myColor === 'black'))) {
+        setSelectedSquare([row, col]);
+      }
+    }
+  };
+
+  const activateSurge = () => {
+    const myColor = user.uid === gameData.players.white ? 'white' : 'black';
+    if (gameData.pulsePoints[myColor] >= 3 && gameData.lastMove) {
+      setSurgeActive(true);
+      setSurgePiecePos(gameData.lastMove.to);
+      const gameDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', currentGameId);
+      updateDoc(gameDocRef, {
+        [`pulsePoints.${myColor}`]: gameData.pulsePoints[myColor] - 3,
+        turn: myColor 
+      });
+    }
+  };
+
+  if (loading) return (
+    <div className="flex items-center justify-center min-h-screen bg-slate-950 text-cyan-400 font-bold italic uppercase">
+      <Loader2 className="animate-spin mr-2" /> Connecting to Pulse...
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans p-4 md:p-8 selection:bg-cyan-500/30">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <div className="flex items-center gap-3">
+            <div className="bg-cyan-600 p-2 rounded-lg shadow-lg"><Zap className="text-white fill-white" size={24} /></div>
+            <h1 className="text-2xl font-black tracking-tighter uppercase italic">PULSE<span className="text-cyan-400 not-italic">CHESS</span></h1>
+          </div>
+          {user && (
+            <div className="text-[10px] text-slate-500 font-mono bg-slate-900 px-3 py-1 rounded-full border border-slate-800">
+              UID: {user.uid}
+            </div>
+          )}
+        </div>
+
+        {view === 'lobby' ? (
+          <div className="grid md:grid-cols-2 gap-8 py-12">
+            <div onClick={createGame} className="bg-slate-900/40 p-12 rounded-3xl border border-slate-800 flex flex-col items-center justify-center cursor-pointer hover:border-cyan-500/50 transition-all group">
+              <Plus className="text-cyan-500 mb-6 group-hover:scale-110 transition-transform" size={64} />
+              <h2 className="text-2xl font-black uppercase text-white">Host Match</h2>
+              <p className="text-slate-500 mt-2 text-center">Start a new match and invite a friend.</p>
+            </div>
+            <div className="bg-slate-900/40 p-12 rounded-3xl border border-slate-800 space-y-6">
+              <h2 className="text-2xl font-black uppercase text-white">Join Match</h2>
+              <input id="join-input" placeholder="GAME ID" className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-6 py-4 text-center font-mono text-xl text-cyan-400 outline-none uppercase" />
+              <button onClick={() => { const id = document.getElementById('join-input').value; if(id) joinGame(id.trim()); }} className="w-full bg-cyan-600 hover:bg-cyan-500 py-4 rounded-2xl font-black uppercase tracking-widest transition-all">Establish Link</button>
+            </div>
+          </div>
+        ) : (
+          <div className="grid lg:grid-cols-12 gap-8">
+            <div className="lg:col-span-3 space-y-4 order-2 lg:order-1">
+              <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+                <h3 className="font-black uppercase tracking-widest text-xs mb-6 text-cyan-400 flex items-center gap-2"><Activity size={14} /> Pulse Meter</h3>
+                {[
+                  { label: 'You', color: 'cyan', pts: gameData?.pulsePoints[user.uid === gameData?.players.white ? 'white' : 'black'] },
+                  { label: 'Opponent', color: 'slate', pts: gameData?.pulsePoints[user.uid === gameData?.players.white ? 'black' : 'white'] }
+                ].map((stat, i) => (
+                  <div key={i} className="mb-6 last:mb-0">
+                    <div className="flex justify-between text-[10px] font-bold uppercase mb-2 text-slate-500">
+                      <span>{stat.label}</span>
+                      <span>{stat.pts}/10</span>
+                    </div>
+                    <div className="h-3 bg-slate-800 rounded-full border border-slate-700/50">
+                      <div className={`h-full transition-all duration-700 ${stat.color === 'cyan' ? 'bg-cyan-500 shadow-[0_0_10px_rgba(6,182,212,0.5)]' : 'bg-slate-600'}`} style={{ width: `${(stat.pts / 10) * 100}%` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <button 
+                disabled={surgeActive || (gameData?.pulsePoints[user.uid === gameData?.players.white ? 'white' : 'black'] < 3) || gameData?.turn !== (user.uid === gameData?.players.white ? 'white' : 'black')}
+                onClick={activateSurge}
+                className={`w-full p-4 rounded-xl border-2 font-black uppercase flex items-center justify-between transition-all ${surgeActive ? 'bg-orange-500 border-orange-400 animate-pulse text-white' : 'bg-slate-800 border-cyan-500/50 text-cyan-400 hover:bg-slate-700'}`}>
+                <Flame size={16} /> <span>Surge Move</span> <span className="text-[10px] bg-black/20 px-2 py-0.5 rounded">3 PTS</span>
+              </button>
+            </div>
+
+            <div className="lg:col-span-6 flex flex-col items-center gap-6 order-1 lg:order-2">
+              {gameData?.winner && <div className="bg-cyan-500 text-white w-full py-4 rounded-xl text-center font-black uppercase animate-bounce italic tracking-widest"><Trophy className="inline-block mr-2" /> {gameData.winner} Wins!</div>}
+              <div className="bg-slate-800 p-2 sm:p-4 rounded-3xl shadow-2xl border-8 border-slate-900">
+                <div className="grid grid-cols-8 border-4 border-slate-950">
+                  {gameData && JSON.parse(gameData.board).map((row, rIdx) => 
+                    row.map((piece, cIdx) => {
+                      const isDark = (rIdx + cIdx) % 2 === 1;
+                      const isCore = CORE_SQUARES.some(([r, c]) => r === rIdx && c === cIdx);
+                      const isSelected = selectedSquare?.[0] === rIdx && selectedSquare?.[1] === cIdx;
+                      return (
+                        <div key={`${rIdx}-${cIdx}`} onClick={() => handleSquareClick(rIdx, cIdx)}
+                          className={`w-10 h-10 sm:w-14 sm:h-14 md:w-16 md:h-16 flex items-center justify-center text-4xl sm:text-5xl cursor-pointer select-none transition-all relative
+                            ${isDark ? 'bg-slate-700' : 'bg-slate-400'}
+                            ${isCore ? 'after:content-[""] after:absolute after:inset-1 after:border-2 after:border-cyan-500/30 after:rounded-lg' : ''}
+                            ${isSelected ? 'bg-cyan-500/30 ring-4 ring-cyan-400 ring-inset z-10' : ''}`}>
+                          <span className={`${piece === piece?.toUpperCase() ? 'text-white' : 'text-slate-950'} drop-shadow-lg`}>{piece ? PIECE_ICONS[piece] : ''}</span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+              <div className="flex gap-4 w-full">
+                 <button onClick={() => setView('lobby')} className="flex-1 py-3 bg-slate-900 border border-slate-800 rounded-xl text-[10px] font-black uppercase tracking-widest text-slate-500 hover:text-red-400 transition-colors">Abort</button>
+                 <button onClick={() => navigator.clipboard.writeText(currentGameId)} className="flex-1 py-3 bg-slate-800 rounded-xl text-[10px] font-black uppercase flex items-center justify-center gap-2 text-cyan-400"><Target size={14} /> {currentGameId}</button>
+              </div>
+            </div>
+
+            <div className="lg:col-span-3 space-y-6 order-3">
+              <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+                <h3 className="text-xs font-black uppercase text-slate-400 mb-4 tracking-widest flex items-center gap-2"><Crown size={14} className="text-yellow-500" /> King Ability</h3>
+                <p className={`text-[10px] font-bold uppercase ${gameData?.crownStepUsed[user.uid === gameData?.players.white ? 'white' : 'black'] ? 'text-slate-600' : 'text-green-400'}`}>
+                  {gameData?.crownStepUsed[user.uid === gameData?.players.white ? 'white' : 'black'] ? 'Crown Step Used' : 'Ready: Knight Jump'}
+                </p>
+              </div>
+              <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+                <h3 className="text-xs font-black uppercase text-slate-400 mb-4 tracking-widest flex items-center gap-2"><Zap size={14} className="text-cyan-400" /> Core Squares</h3>
+                <div className="grid grid-cols-2 gap-2">
+                   {['D4','E4','D5','E5'].map(coord => <div key={coord} className="bg-slate-800 p-2 rounded text-center text-[10px] font-mono text-cyan-500">{coord}</div>)}
+                </div>
+                <p className="text-[9px] text-slate-500 mt-4 leading-relaxed uppercase font-bold">Land here for +1 Pulse Point.</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
